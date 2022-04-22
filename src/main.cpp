@@ -1,143 +1,317 @@
 #include <Arduino.h>
-#include <jled.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Wire.h>
+#include <LiquidCrystal.h>
+#include "print_mpu_settings.h"
+#include "DebouncedButton.h"
+#include <SdFat.h>
+#include "util.h"
 
-#define PIN_RELAY_ECVT 4
-#define PIN_RELAY_ALTERNATOR 9
+#define PIN_DAQ_TOGGLE 11
+#define PIN_MODE_SWITCH 8
 
-#define PIN_INDICATOR_ECVT 11
-#define PIN_INDICATOR_ALTERNATOR 10
+#define PIN_SHOCK_BL A14
+#define PIN_SHOCK_FL A15
+#define PIN_SHOCK_BR A16
+#define PIN_SHOCK_FR A17
 
-#define PIN_TOGGLE_ECVT 8
-#define PIN_TOGGLE_ALTERNATOR 7
+#define PIN_HALL_FR A5 //Front right wheel
+#define PIN_HALL_FL A6 //Front left wheel
+#define PIN_HALL_REAR A7 //Rear wheels
+#define PIN_HALL_ESP1 A8 //Engine speed 1
+#define PIN_HALL_ESP2 A9 //Engine speed 2
 
-#define PIN_BATTERY_SENSE A0
+#define LCD_REFRESH_INTERVAL 250
+#define SENSOR_REFRESH_INTERVAL 33
 
-const float VOLTAGE_BATTERY_OVERRIDE = 12.;
-const float VOLTAGE_OVERRIDE_DEACTIVATE = 13.;
+#define RESTART_ADDR 0xE000ED0C
+#define READ_RESTART() (*(volatile uint32_t *)RESTART_ADDR)
+#define WRITE_RESTART(val) ((*(volatile uint32_t *)RESTART_ADDR) = (val))
 
-const uint64_t ALTERNATOR_MIN_OVERRIDE_TIME = 10000;
-const uint64_t ALTERNATOR_DEBOUNCE_INTERVAL = 1000;
+void hall_fr_isr(void);
 
-const uint64_t NUM_AVG_SAMPLES = 20;
-const uint64_t BATTERY_SAMPLE_INTERVAL = 250;
+void hall_fl_isr(void);
 
-// MANUALLY CALIBRATED!!!
-const float DIV_CONSTANT_BATTERY = 5. / 1024. / 0.2555;
+void hall_rear_isr(void);
 
+void hall_esp1_isr(void);
 
-float samples[NUM_AVG_SAMPLES];
-size_t sample_idx;
-uint64_t last_sample;
+void hall_esp2_isr(void);
 
-JLed indicator_alternator(PIN_INDICATOR_ALTERNATOR);
-JLed indicator_ecvt(PIN_INDICATOR_ECVT);
+struct {
+    uint16_t BL;
+    uint16_t FL;
+    uint16_t BR;
+    uint16_t FR;
+} shock_data;
 
-float voltage_battery;
+struct {
+    uint16_t FR;
+    uint16_t FL;
+    uint16_t REAR;
+    uint16_t ESP1;
+    uint16_t ESP2;
+} hall_data;
 
-float read_battery_voltage() {
-    return analogRead(PIN_BATTERY_SENSE) * DIV_CONSTANT_BATTERY;
-}
+int NUM_SCREENS = 5;
+enum LCDScreen {
+    LOG_STATUS,
+    ACCEL_MEASUREMENTS,
+    SHOCKS,
+    HALL1,
+    HALL2,
 
-float compute_avg_battery_voltage() {
-    float sum = 0;
-    for (auto i: samples) {
-        sum += i;
-    }
-    return sum / (float) NUM_AVG_SAMPLES;
-}
+    SD_ERROR,
+    FILE_ERROR,
+};
+
+Adafruit_MPU6050 mpu;
+LiquidCrystal lcd(32, 31, 30, 29, 28, 27);
+
+sensors_event_t a, g, temp;
+LCDScreen lcd_screen;
+SdFs sd;
+FsFile file;
+unsigned long t_start = 0;
+char filename[32];
+
+volatile uint32_t fr_revs = 0;
+volatile uint32_t fl_revs = 0;
+volatile uint32_t rear_revs = 0;
+volatile uint32_t esp1_revs = 0;
+volatile uint32_t esp2_revs = 0;
+
+bool is_logging;
+
+DebouncedButton mode_switch(PIN_MODE_SWITCH, 500);
 
 void setup() {
     Serial.begin(115200);
-    pinMode(PIN_RELAY_ECVT, OUTPUT);
-    pinMode(PIN_RELAY_ALTERNATOR, OUTPUT);
+    pinMode(PIN_DAQ_TOGGLE, INPUT_PULLUP);
+    pinMode(PIN_MODE_SWITCH, INPUT_PULLUP);
 
-    pinMode(PIN_INDICATOR_ECVT, OUTPUT);
-    pinMode(PIN_INDICATOR_ALTERNATOR, OUTPUT);
+    pinMode(PIN_SHOCK_BL, INPUT);
+    pinMode(PIN_SHOCK_FL, INPUT);
+    pinMode(PIN_SHOCK_BR, INPUT);
+    pinMode(PIN_SHOCK_FR, INPUT);
 
-    pinMode(PIN_TOGGLE_ALTERNATOR, INPUT_PULLUP);
-    pinMode(PIN_TOGGLE_ECVT, INPUT_PULLUP);
+    pinMode(PIN_HALL_FR, INPUT);
+    pinMode(PIN_HALL_FL, INPUT);
+    pinMode(PIN_HALL_REAR, INPUT);
+    pinMode(PIN_HALL_ESP1, INPUT);
+    pinMode(PIN_HALL_ESP2, INPUT);
 
-    pinMode(PIN_BATTERY_SENSE, INPUT);
+    attachInterrupt(digitalPinToInterrupt(PIN_HALL_FR), hall_fr_isr, RISING);
+    attachInterrupt(digitalPinToInterrupt(PIN_HALL_FL), hall_fl_isr, RISING);
+    attachInterrupt(digitalPinToInterrupt(PIN_HALL_REAR), hall_rear_isr,
+                    RISING);
+    attachInterrupt(digitalPinToInterrupt(PIN_HALL_ESP1), hall_esp1_isr,
+                    RISING);
+    attachInterrupt(digitalPinToInterrupt(PIN_HALL_ESP2), hall_esp2_isr,
+                    RISING);
+
+    lcd.begin(16, 2);
+    lcd.print("DAQ Starting...");
+
+    Serial.println("DAQ Starting");
+
+    // Try to initialize!
+    if (!mpu.begin(MPU6050_I2CADDR_DEFAULT, &Wire2, 0)) {
+        Serial.println("Failed to find MPU6050 chip");
+
+        lcd.clear();
+        lcd.print("MPU6050 Failure");
+        lcd.setCursor(0, 1);
+        lcd.print("Check wiring!");
+
+        while (true);
+    }
+
+    Serial.println("MPU6050 Found!");
+    mpu.setAccelerometerRange(MPU6050_RANGE_16_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+    print_mput_settings(mpu);
+
+    while (!digitalRead(PIN_DAQ_TOGGLE)) {
+        lcd.clear();
+        lcd.print("Turn off DAQ");
+        lcd.setCursor(0, 1);
+        lcd.print("toggle!!!");
+        delay(500);
+        lcd.clear();
+        delay(500);
+    }
+
+    delay(100);
+    Serial.println("Setup done!");
+}
+
+
+void render_LCD() {
+    lcd.clear();
+    switch (lcd_screen) {
+        case LOG_STATUS:
+            if (is_logging) {
+                lcd.printf("Logging to:");
+                lcd.setCursor(0, 1);
+                lcd.print(filename);
+            } else {
+                lcd.printf("Ready to log!");
+            }
+            break;
+
+        case ACCEL_MEASUREMENTS:
+            lcd.printf("X:%.2f Y:%.2f", a.acceleration.x, a.acceleration.y);
+            lcd.setCursor(0, 1);
+            lcd.printf("Z:%.2f ", a.acceleration.z);
+            break;
+
+        case SHOCKS:
+            lcd.printf("FL:%d FR:%d", shock_data.FL, shock_data.FR);
+            lcd.setCursor(0, 1);
+            lcd.printf("BL:%d BR:%d", shock_data.BL, shock_data.BR);
+            break;
+
+        case HALL1:
+            lcd.printf("FL:%d FR:%d", hall_data.FL, hall_data.FR);
+            lcd.setCursor(0, 1);
+            lcd.printf("REAR:%d", hall_data.REAR);
+            break;
+
+        case HALL2:
+            lcd.printf("ESP1:%d", hall_data.ESP1);
+            lcd.setCursor(0, 1);
+            lcd.printf("ESP2:%d", hall_data.ESP2);
+            break;
+
+        case SD_ERROR:
+            lcd.printf("SD INIT ERROR!");
+            break;
+
+        case FILE_ERROR:
+            lcd.printf("COULDN'T CREATE");
+            lcd.setCursor(0, 1);
+            lcd.printf("FILE!!!");
+            break;
+
+        default:
+            lcd.printf("SCREEN NOT FOUND");
+    }
 
 }
 
-void alternator_controller() {
-    static unsigned long last_toggle;
-    static enum {
-        ACTIVE,
-        ACTIVE_,
+unsigned long last_lcd_refresh = 0;
+unsigned long last_sensor_refresh = 0;
 
-        ACTIVE_VOLTAGE_OVERRIDE,
-        ACTIVE_VOLTAGE_OVERRIDE_,
+void init_log() {
 
-        INACTIVE,
-        INACTIVE_,
-    } state = INACTIVE;
-
-    switch (state) {
-        case ACTIVE:
-            if (millis() - last_toggle < ALTERNATOR_DEBOUNCE_INTERVAL) break;
-
-            state = ACTIVE_;
-
-            indicator_alternator.On().Forever();
-            digitalWrite(PIN_RELAY_ALTERNATOR, HIGH);
-            last_toggle = millis();
-
-        case ACTIVE_:
-            if (!digitalRead(PIN_TOGGLE_ALTERNATOR)) {
-                state = INACTIVE;
+    if (!sd.begin(BUILTIN_SDCARD)) {
+        lcd_screen = SD_ERROR;
+        if (sd.sdErrorCode()) {
+            if (sd.sdErrorCode() == SD_CARD_ERROR_ACMD41) {
+                Serial.println("Try power cycling the SD card.");
             }
-            break;
-
-        case ACTIVE_VOLTAGE_OVERRIDE:
-            state = ACTIVE_VOLTAGE_OVERRIDE_;
-            indicator_alternator
-                    .Blink(100, 100)
-                    .Forever();
-
-            digitalWrite(PIN_RELAY_ALTERNATOR, HIGH);
-            last_toggle = millis();
-
-        case ACTIVE_VOLTAGE_OVERRIDE_:
-            if (millis() - last_toggle > ALTERNATOR_MIN_OVERRIDE_TIME &&
-                voltage_battery >= VOLTAGE_OVERRIDE_DEACTIVATE) {
-                state = ACTIVE;
-            }
-            break;
-
-        case INACTIVE:
-            if (millis() - last_toggle < ALTERNATOR_DEBOUNCE_INTERVAL) break;
-
-            state = INACTIVE_;
-
-            indicator_alternator.Off().Forever();
-            digitalWrite(PIN_RELAY_ALTERNATOR, LOW);
-            last_toggle = millis();
-
-        case INACTIVE_:
-            if (digitalRead(PIN_TOGGLE_ALTERNATOR)) {
-                state = ACTIVE;
-            }
-            if (voltage_battery < VOLTAGE_BATTERY_OVERRIDE) {
-                state = ACTIVE_VOLTAGE_OVERRIDE;
-            }
-            break;
+            sd.printSdError(&Serial);
+        }
+        return;
+    }
+    select_next_filename(filename, &sd);
+    if (!file.open(filename, O_RDWR | O_CREAT)) {
+        lcd_screen = FILE_ERROR;
+        return;
     }
 
-    Serial.println(state);
+    file.printf(
+            "Time (s), Xaccel (m/s^2), Yaccel (m/s^2), Zaccel (m/s^2), Xgyro (rad/s), Ygyro (rad/s), Zgyro (rad/s), FLsus, FRsus, BLsus, BRsus\n");
+    t_start = millis();
+    lcd_screen = LOG_STATUS;
+    is_logging = true;
 }
 
 void loop() {
-    if (millis() - last_sample > BATTERY_SAMPLE_INTERVAL) {
-        last_sample = millis();
-        samples[sample_idx++ % NUM_AVG_SAMPLES] = read_battery_voltage();
-        voltage_battery = compute_avg_battery_voltage();
+
+    //INIT timers
+    if (last_lcd_refresh == 0) last_lcd_refresh = millis();
+    if (last_sensor_refresh == 0) last_sensor_refresh = millis();
+
+    //Input checks
+    if (!digitalRead(PIN_DAQ_TOGGLE)) { // Switch is ON
+        if (!is_logging) init_log(); //State changed, init file.
+
+    } else { // Switch is OFF
+        if (is_logging) { //State changed, finish up.
+            Serial.println("Stopping log!");
+
+            file.truncate();
+            file.flush();
+            file.sync();
+            file.close();
+
+            lcd_screen = LOG_STATUS;
+            is_logging = false;
+        }
     }
 
 
-    alternator_controller();
+    if (mode_switch.isTriggered()) {
+        int screen = static_cast<int>(lcd_screen);
+        if (++screen >= NUM_SCREENS) screen = 0;
+        lcd_screen = static_cast<LCDScreen>(screen);
+    }
 
-    indicator_alternator.Update();
-    //delay(100);
+    if (millis() - last_sensor_refresh > SENSOR_REFRESH_INTERVAL) {
+        last_sensor_refresh += SENSOR_REFRESH_INTERVAL;
+        /* Get new sensor events with the readings */
+//        Serial.println("GETTING DATA!");
+        shock_data.BL = analogRead(PIN_SHOCK_BL);
+        shock_data.FL = analogRead(PIN_SHOCK_FL);
+        shock_data.BR = analogRead(PIN_SHOCK_BR);
+        shock_data.FR = analogRead(PIN_SHOCK_FR);
+
+
+        mpu.getEvent(&a, &g, &temp);
+        //file.print("TEST TEST TEST");
+        file.printf("%f, %f, %f, %f, %f, %f, %f, %d, %d, %d, %d\n",
+                    (millis() - t_start) / 1000.f,
+                    a.acceleration.x, a.acceleration.y, a.acceleration.z,
+                    g.gyro.x, g.gyro.y, g.gyro.z,
+                    shock_data.FL, shock_data.FR, shock_data.BL, shock_data.BR);
+
+        hall_data.FR = fr_revs / (millis() * 1000 * 60);
+        hall_data.FL = fl_revs / (millis() * 1000 * 60);
+        hall_data.REAR = rear_revs / (millis() * 1000 * 60);
+        hall_data.ESP1 = esp1_revs / (millis() * 1000 * 60);
+        hall_data.ESP2 = esp2_revs / (millis() * 1000 * 60);
+    }
+
+    if (millis() - last_lcd_refresh > LCD_REFRESH_INTERVAL) {
+        last_lcd_refresh = millis();
+
+        render_LCD();
+    }
+
+
+}
+
+void hall_fr_isr(void) {
+    fr_revs++;
+}
+
+void hall_fl_isr(void) {
+    fl_revs++;
+}
+
+void hall_rear_isr(void) {
+    rear_revs++;
+}
+
+void hall_esp1_isr(void) {
+    esp1_revs++;
+}
+
+void hall_esp2_isr(void) {
+    esp2_revs++;
 }
